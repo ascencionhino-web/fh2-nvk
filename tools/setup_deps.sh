@@ -28,6 +28,9 @@ apply() {
 fetch prototype2-nx "$P2_URL" "$P2_PIN"
 fetch masseffect-nx "$ME_URL" "$ME_PIN"
 fetch mesa-switch-src "$MESA_URL" "$MESA_PIN"
-apply "$REF/mesa-switch-src" "$REF/prototype2-nx/patches/mesa-switch.patch"
-apply "$REF/mesa-switch-src" "$ROOT/patches/fh2-nvk.patch"
+# Un solo parche (el de prototype2-nx y el de FH2 juntos): el script de masseffect-nx comprueba si ya esta aplicado con
+# --reverse --check de ESE archivo y, si no, lo vuelve a aplicar.
+mkdir -p "$ROOT/out"
+cat "$REF/prototype2-nx/patches/mesa-switch.patch" "$ROOT/patches/fh2-nvk.patch" > "$ROOT/out/mesa-switch-fh2.patch"
+apply "$REF/mesa-switch-src" "$ROOT/out/mesa-switch-fh2.patch"
 echo OK

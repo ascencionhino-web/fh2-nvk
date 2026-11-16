@@ -11,7 +11,7 @@ mkdir -p "$OUT" "$ROOT/out"
 
 PATCHED="$ROOT/out/build_mesa_docker.sh"
 # Docker crea los archivos como root: el mv final (y el chown) se hacen con sudo si hace falta.
-sed -e "s|^PATCH=.*|PATCH=\"$REF/prototype2-nx/patches/mesa-switch.patch\"|" \
+sed -e "s|^PATCH=.*|PATCH=\"$ROOT/out/mesa-switch-fh2.patch\"|" \
     -e 's|^mv "\$SRC/builddir-switch/libvulkan_merged.a" "\$LIBDIR/libvulkan.a"|sudo mv -f "$SRC/builddir-switch/libvulkan_merged.a" "$LIBDIR/libvulkan.a"|' \
     -e "s|^  \./build-switch\.sh\$|  bash \"$ROOT/tools/mesa_patch_build_switch.sh\" build-switch.sh \&\& ./build-switch.sh|" \
     "$REF/masseffect-nx/mesa/build_mesa_docker.sh" > "$PATCHED"
