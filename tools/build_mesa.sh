@@ -29,6 +29,9 @@ docker run --rm -v "$OUT:/mesa:ro" devkitpro/devkita64:latest bash -c \
   && docker run --rm -v "$OUT:/mesa:ro" devkitpro/devkita64:latest bash -c \
      "$nm --defined-only /mesa/opt/devkitpro/portlibs/switch/lib/libvulkan.a | grep -Eq ' [BD] nvk_fh2_barreras\$'" \
   && echo "OK: libvulkan.a trae las barreras de FH2" \
+  && docker run --rm -v "$OUT:/mesa:ro" devkitpro/devkita64:latest bash -c \
+     "$nm --defined-only /mesa/opt/devkitpro/portlibs/switch/lib/libvulkan.a | grep -Eq ' [BD] nvk_fh2_barreras_razones\$'" \
+  && echo "OK: libvulkan.a trae las razones del modo 3" \
   || { echo "ERROR: libvulkan.a no trae los parches NVK" >&2; exit 1; }
 
 # Todos los miembros del archivo deben ser AArch64 (si la parte Rust sale en x86, el enlazador del NRO dice "incompatible").

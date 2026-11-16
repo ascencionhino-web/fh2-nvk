@@ -1,8 +1,8 @@
 diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
-index b48b81f..d577a5b 100644
+index b48b81f..fdd5f5e 100644
 --- a/src/nouveau/vulkan/nvk_cmd_buffer.c
 +++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
-@@ -969,6 +969,101 @@ nvk_cmd_frag_barrier_only(struct nvk_cmd_buffer *cmd,
+@@ -969,6 +969,104 @@ nvk_cmd_frag_barrier_only(struct nvk_cmd_buffer *cmd,
  #endif
  }
  
@@ -23,7 +23,10 @@ index b48b81f..d577a5b 100644
 + * The counters let the app report what was skipped.
 + */
 +int nvk_fh2_barreras = 0;
-+uint64_t nvk_fh2_barreras_cuentas[4]; /* WFI barriers seen, skipped by mode 1, skipped by mode 2, kept */
++uint64_t nvk_fh2_barreras_cuentas[4]; /* WFI barriers seen, skipped by mode 1, skipped by mode 2 or 3, kept */
++/* Mode 3, why a barrier kept its wait: [0] not on the 3D engine, [1] buffer barriers, [2] image layout or queue,
++ * [3] stages or accesses outside graphics/transfer; done: [4] WAIT_FOR_IDLE, [5] WAIT_FOR_IDLE + shader data flush. */
++uint64_t nvk_fh2_barreras_razones[8];
 +
 +static int
 +nvk_fh2_clase_barrera(VkPipelineStageFlags2 src, VkAccessFlags2 src_acc,
@@ -79,7 +82,8 @@ index b48b81f..d577a5b 100644
 +                                      VK_PIPELINE_STAGE_2_COPY_BIT |
 +                                      VK_PIPELINE_STAGE_2_BLIT_BIT |
 +                                      VK_PIPELINE_STAGE_2_RESOLVE_BIT |
-+                                      VK_PIPELINE_STAGE_2_CLEAR_BIT;
++                                      VK_PIPELINE_STAGE_2_CLEAR_BIT |
++                                      VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_COPY_BIT_KHR;
 +   const VkAccessFlags2 acc = VK_ACCESS_2_INDIRECT_COMMAND_READ_BIT |
 +                              VK_ACCESS_2_INDEX_READ_BIT |
 +                              VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
@@ -93,8 +97,7 @@ index b48b81f..d577a5b 100644
 +                              VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
 +                              VK_ACCESS_2_TRANSFER_READ_BIT |
 +                              VK_ACCESS_2_TRANSFER_WRITE_BIT;
-+   src = vk_expand_src_stage_flags2(src);
-+   dst = vk_expand_dst_stage_flags2(dst);
++   /* The masks as the app wrote them (not expanded: ALL_TRANSFER would expand to stages FH2 never uses). */
 +   if (!src || (src & ~graf) || (dst & ~graf))
 +      return false;
 +   return !(src_acc & ~acc) && !(dst_acc & ~acc);
@@ -104,16 +107,19 @@ index b48b81f..d577a5b 100644
  void
  nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
                         const VkDependencyInfo *dep,
-@@ -1024,6 +1119,60 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
+@@ -1024,6 +1122,69 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
     if (!(engines & (NVKMD_ENGINE_3D | NVKMD_ENGINE_COMPUTE)))
        barriers &= ~NVK_BARRIER_FLUSH_SHADER_DATA;
  
 +#ifdef HAVE_SWITCH_PLATFORM
 +   {
 +      const int modo = p_atomic_read_relaxed(&nvk_fh2_barreras);
-+      if (modo > 0 && wait && barriers == NVK_BARRIER_WFI &&
++      const bool solo_wfi = barriers == NVK_BARRIER_WFI;
++      /* A transfer write in the source (FH2's render passes declare it) adds a shader data flush, itself a WFI. */
++      const bool wfi_flush = barriers == (NVK_BARRIER_WFI | NVK_BARRIER_FLUSH_SHADER_DATA);
++      if (modo > 0 && wait && (solo_wfi || (modo >= 3 && wfi_flush)) &&
 +          !(dep->dependencyFlags & VK_DEPENDENCY_ASYMMETRIC_EVENT_BIT_KHR)) {
-+         int clase = 1; /* the lightest class every barrier of the dependency fits in */
++         int clase = solo_wfi ? 1 : 0; /* the lightest class every barrier of the dependency fits in */
 +         for (uint32_t i = 0; i < dep->memoryBarrierCount && clase; i++) {
 +            const VkMemoryBarrier2 *b = &dep->pMemoryBarriers[i];
 +            const int c = nvk_fh2_clase_barrera(b->srcStageMask, b->srcAccessMask, b->dstStageMask, b->dstAccessMask);
@@ -128,22 +134,28 @@ index b48b81f..d577a5b 100644
 +         }
 +         p_atomic_inc(&nvk_fh2_barreras_cuentas[0]);
 +         bool psb = false;
-+         if (modo >= 3 && clase != 1 &&
-+             pdev->info.cls_eng3d >= MAXWELL_A &&
-+             nvk_cmd_buffer_last_subchannel(cmd) == SUBC_NV9097 &&
-+             !dep->bufferMemoryBarrierCount) {
-+            psb = true;
-+            for (uint32_t i = 0; i < dep->memoryBarrierCount && psb; i++) {
++         if (modo >= 3 && clase != 1 && pdev->info.cls_eng3d >= MAXWELL_A) {
++            int razon = -1;
++            if (nvk_cmd_buffer_last_subchannel(cmd) != SUBC_NV9097)
++               razon = 0;
++            else if (dep->bufferMemoryBarrierCount)
++               razon = 1;
++            for (uint32_t i = 0; i < dep->memoryBarrierCount && razon < 0; i++) {
 +               const VkMemoryBarrier2 *b = &dep->pMemoryBarriers[i];
-+               psb = nvk_fh2_barrera_3d(b->srcStageMask, b->srcAccessMask, b->dstStageMask, b->dstAccessMask);
++               if (!nvk_fh2_barrera_3d(b->srcStageMask, b->srcAccessMask, b->dstStageMask, b->dstAccessMask))
++                  razon = 3;
 +            }
-+            for (uint32_t i = 0; i < dep->imageMemoryBarrierCount && psb; i++) {
++            for (uint32_t i = 0; i < dep->imageMemoryBarrierCount && razon < 0; i++) {
 +               const VkImageMemoryBarrier2 *b = &dep->pImageMemoryBarriers[i];
-+               psb = b->srcQueueFamilyIndex == b->dstQueueFamilyIndex &&
-+                     b->oldLayout != VK_IMAGE_LAYOUT_UNDEFINED &&
-+                     b->oldLayout != VK_IMAGE_LAYOUT_PREINITIALIZED &&
-+                     nvk_fh2_barrera_3d(b->srcStageMask, b->srcAccessMask, b->dstStageMask, b->dstAccessMask);
++               if (b->srcQueueFamilyIndex != b->dstQueueFamilyIndex ||
++                   b->oldLayout == VK_IMAGE_LAYOUT_UNDEFINED ||
++                   b->oldLayout == VK_IMAGE_LAYOUT_PREINITIALIZED)
++                  razon = 2;
++               else if (!nvk_fh2_barrera_3d(b->srcStageMask, b->srcAccessMask, b->dstStageMask, b->dstAccessMask))
++                  razon = 3;
 +            }
++            psb = razon < 0;
++            p_atomic_inc(&nvk_fh2_barreras_razones[psb ? (solo_wfi ? 4 : 5) : razon]);
 +         }
 +         if (psb) {
 +            /* counted with mode 2 ("lectura de textura") */
@@ -151,7 +163,7 @@ index b48b81f..d577a5b 100644
 +            struct nv_push *p = nvk_cmd_buffer_push(cmd, 2);
 +            __push_immd(p, SUBC_NV9097, NVB197_PIXEL_SHADER_BARRIER,
 +                        NVB197_PIXEL_SHADER_BARRIER_SYSMEMBAR_ENABLE_FALSE);
-+            barriers &= ~NVK_BARRIER_WFI;
++            barriers &= ~(NVK_BARRIER_WFI | NVK_BARRIER_FLUSH_SHADER_DATA);
 +         } else if (clase != 0 && clase <= modo) {
 +            p_atomic_inc(&nvk_fh2_barreras_cuentas[clase]);
 +            barriers &= ~NVK_BARRIER_WFI;
