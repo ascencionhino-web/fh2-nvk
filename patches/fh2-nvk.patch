@@ -1,0 +1,94 @@
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index b48b81f..9e1e5d6 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -969,6 +969,53 @@ nvk_cmd_frag_barrier_only(struct nvk_cmd_buffer *cmd,
+ #endif
+ }
+ 
++#ifdef HAVE_SWITCH_PLATFORM
++/* FH2 NX (NXMASTER-Ascencion H.O): lighter barriers, asked by the app (nvk_fh2_barreras).
++ *
++ * Every barrier with any source stage becomes a full WAIT_FOR_IDLE above, and FH2's native renderer opens about
++ * 70 render passes per frame, each with external dependencies: the GPU drains between passes. Measured on the
++ * console: the scene costs the same GPU time at 40 % and 55 % render scale, so the frame is not pixel bound.
++ *
++ * 0 = as always.
++ * 1 = no WFI when every barrier only orders attachment work after attachment work (source and destination stages
++ *     within colour output and the fragment tests, attachment accesses only): the 3D pipe keeps ROP order.
++ * 2 = also no WFI when the source is attachment work and the destination reads it in shaders (render-to-texture);
++ *     the texture cache is still invalidated (nvk_cmd_invalidate_deps). A TEST: it can show stale texels.
++ * The counters let the app report what was skipped.
++ */
++int nvk_fh2_barreras = 0;
++uint64_t nvk_fh2_barreras_cuentas[4]; /* WFI barriers seen, skipped by mode 1, skipped by mode 2, kept */
++
++static int
++nvk_fh2_clase_barrera(VkPipelineStageFlags2 src, VkAccessFlags2 src_acc,
++                      VkPipelineStageFlags2 dst, VkAccessFlags2 dst_acc)
++{
++   const VkPipelineStageFlags2 adj = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
++                                     VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
++                                     VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
++   const VkAccessFlags2 acc_adj = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
++                                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
++                                  VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
++                                  VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++   src = vk_expand_src_stage_flags2(src);
++   dst = vk_expand_dst_stage_flags2(dst);
++   if (src & ~adj)
++      return 0;
++   if (src_acc & ~acc_adj)
++      return 0;
++   if (!(dst & ~adj) && !(dst_acc & ~acc_adj))
++      return 1;
++   const VkPipelineStageFlags2 lectura = adj | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
++                                         VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT;
++   const VkAccessFlags2 acc_lectura = acc_adj | VK_ACCESS_2_SHADER_SAMPLED_READ_BIT |
++                                      VK_ACCESS_2_INPUT_ATTACHMENT_READ_BIT |
++                                      VK_ACCESS_2_SHADER_READ_BIT;
++   if (!(dst & ~lectura) && !(dst_acc & ~acc_lectura))
++      return 2;
++   return 0;
++}
++#endif
++
+ void
+ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
+                        const VkDependencyInfo *dep,
+@@ -1024,6 +1071,35 @@ nvk_cmd_flush_wait_dep(struct nvk_cmd_buffer *cmd,
+    if (!(engines & (NVKMD_ENGINE_3D | NVKMD_ENGINE_COMPUTE)))
+       barriers &= ~NVK_BARRIER_FLUSH_SHADER_DATA;
+ 
++#ifdef HAVE_SWITCH_PLATFORM
++   {
++      const int modo = p_atomic_read_relaxed(&nvk_fh2_barreras);
++      if (modo > 0 && wait && barriers == NVK_BARRIER_WFI &&
++          !(dep->dependencyFlags & VK_DEPENDENCY_ASYMMETRIC_EVENT_BIT_KHR)) {
++         int clase = 1; /* the lightest class every barrier of the dependency fits in */
++         for (uint32_t i = 0; i < dep->memoryBarrierCount && clase; i++) {
++            const VkMemoryBarrier2 *b = &dep->pMemoryBarriers[i];
++            const int c = nvk_fh2_clase_barrera(b->srcStageMask, b->srcAccessMask, b->dstStageMask, b->dstAccessMask);
++            clase = c == 0 ? 0 : MAX2(clase, c);
++         }
++         for (uint32_t i = 0; i < dep->bufferMemoryBarrierCount && clase; i++)
++            clase = 0; /* buffers: as always */
++         for (uint32_t i = 0; i < dep->imageMemoryBarrierCount && clase; i++) {
++            const VkImageMemoryBarrier2 *b = &dep->pImageMemoryBarriers[i];
++            const int c = nvk_fh2_clase_barrera(b->srcStageMask, b->srcAccessMask, b->dstStageMask, b->dstAccessMask);
++            clase = c == 0 ? 0 : MAX2(clase, c);
++         }
++         p_atomic_inc(&nvk_fh2_barreras_cuentas[0]);
++         if (clase != 0 && clase <= modo) {
++            p_atomic_inc(&nvk_fh2_barreras_cuentas[clase]);
++            barriers &= ~NVK_BARRIER_WFI;
++         } else {
++            p_atomic_inc(&nvk_fh2_barreras_cuentas[3]);
++         }
++      }
++   }
++#endif
++
+    if (!barriers)
+       return;
+ 

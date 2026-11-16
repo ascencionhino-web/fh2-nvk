@@ -1,0 +1,37 @@
+name: nvk
+
+# NVK para Switch con los parches de FH2. Publica out/mesa-sdk como release (mesa-sdk.tar.zst).
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['patches/**', 'tools/**', '.github/workflows/nvk.yml']
+
+permissions:
+  contents: write
+
+jobs:
+  mesa:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Liberar disco (Mesa necesita ~15 GB)
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; df -h /
+      - name: Compilar Mesa/NVK
+        run: |
+          bash tools/setup_deps.sh mesa
+          bash tools/ci_run.sh Mesa bash tools/build_mesa.sh
+      - name: Empaquetar
+        run: |
+          tar -C out -I 'zstd -19 -T0' -cf mesa-sdk.tar.zst mesa-sdk
+          ls -la mesa-sdk.tar.zst
+          sha256sum mesa-sdk.tar.zst | tee mesa-sdk.tar.zst.sha256
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nvk-${{ github.run_number }}
+          name: nvk-${{ github.run_number }}
+          body: NVK para Switch, commit ${{ github.sha }}
+          files: |
+            mesa-sdk.tar.zst
+            mesa-sdk.tar.zst.sha256
